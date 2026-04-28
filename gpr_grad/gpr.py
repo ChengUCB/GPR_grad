@@ -17,6 +17,10 @@ class GradientGP(nn.Module):
         self.sigma_g = sigma_g
         self.jitter = jitter
 
+    def _kernel_method(self, name):
+        method = getattr(self.kernel, name, None)
+        return method if callable(method) else None
+
     # =========================
     # normalize gradient inputs
     # =========================
@@ -50,6 +54,36 @@ class GradientGP(nn.Module):
     def build_kernel_matrix(self, X_f, X_grad_obs, grad_dims):
         Nf = X_f.shape[0]
         Mg = 0 if X_grad_obs is None else X_grad_obs.shape[0]
+
+        get_k_matrix = self._kernel_method("get_k_matrix")
+        if get_k_matrix is not None:
+            K_ff = get_k_matrix(X_f, X_f)
+
+            if Mg == 0:
+                return K_ff
+
+            get_k_fg_matrix = self._kernel_method("get_k_fg_matrix")
+            get_k_gf_matrix = self._kernel_method("get_k_gf_matrix")
+            get_k_gg_matrix = self._kernel_method("get_k_gg_matrix")
+
+            if (
+                get_k_fg_matrix is not None
+                and get_k_gf_matrix is not None
+                and get_k_gg_matrix is not None
+            ):
+                K_fg = get_k_fg_matrix(X_f, X_grad_obs, grad_dims)
+                K_gf = get_k_gf_matrix(X_grad_obs, X_f, grad_dims)
+                K_gg = get_k_gg_matrix(
+                    X_grad_obs,
+                    X_grad_obs,
+                    x_grad_dims=grad_dims,
+                    y_grad_dims=grad_dims,
+                )
+
+                return torch.cat([
+                    torch.cat([K_ff, K_fg], dim=1),
+                    torch.cat([K_gf, K_gg], dim=1),
+                ], dim=0)
 
         dtype = X_f.dtype
         device = X_f.device
@@ -99,6 +133,18 @@ class GradientGP(nn.Module):
         Ns, D = X_star.shape
         Nf = self.X_f.shape[0]
         Mg = 0 if self.X_grad_obs is None else self.X_grad_obs.shape[0]
+
+        get_k_matrix = self._kernel_method("get_k_matrix")
+        if get_k_matrix is not None:
+            K_sf = get_k_matrix(X_star, self.X_f)
+
+            if Mg == 0:
+                return K_sf
+
+            get_k_fg_matrix = self._kernel_method("get_k_fg_matrix")
+            if get_k_fg_matrix is not None:
+                K_sg = get_k_fg_matrix(X_star, self.X_grad_obs, self.grad_dims)
+                return torch.cat([K_sf, K_sg], dim=1)
 
         K_sf = torch.empty(Ns, Nf, dtype=X_star.dtype, device=X_star.device)
 
@@ -175,11 +221,15 @@ class GradientGP(nn.Module):
 
         Ns = X_star.shape[0]
 
-        K_ss = torch.empty(Ns, Ns, dtype=X_star.dtype, device=X_star.device)
+        get_k_matrix = self._kernel_method("get_k_matrix")
+        if get_k_matrix is not None:
+            K_ss = get_k_matrix(X_star, X_star)
+        else:
+            K_ss = torch.empty(Ns, Ns, dtype=X_star.dtype, device=X_star.device)
 
-        for i in range(Ns):
-            for j in range(Ns):
-                K_ss[i, j] = self.kernel.get_k(X_star[i], X_star[j])
+            for i in range(Ns):
+                for j in range(Ns):
+                    K_ss[i, j] = self.kernel.get_k(X_star[i], X_star[j])
 
         v = torch.cholesky_solve(K_sx.T, self.L)
         cov = K_ss - K_sx @ v
@@ -190,6 +240,10 @@ class GradientGP(nn.Module):
     # gradient covariance
     # =========================
     def build_prior_gradient_kernel(self, X_star):
+        get_k_gg_matrix = self._kernel_method("get_k_gg_matrix")
+        if get_k_gg_matrix is not None:
+            return get_k_gg_matrix(X_star, X_star)
+
         Ns, D = X_star.shape
         K = torch.empty(Ns * D, Ns * D, dtype=X_star.dtype, device=X_star.device)
 
@@ -208,6 +262,22 @@ class GradientGP(nn.Module):
         Ns, D = X_star.shape
         Nf = self.X_f.shape[0]
         Mg = 0 if self.X_grad_obs is None else self.X_grad_obs.shape[0]
+
+        get_k_gf_matrix = self._kernel_method("get_k_gf_matrix")
+        if get_k_gf_matrix is not None:
+            K_gs_f = get_k_gf_matrix(X_star, self.X_f)
+
+            if Mg == 0:
+                return K_gs_f
+
+            get_k_gg_matrix = self._kernel_method("get_k_gg_matrix")
+            if get_k_gg_matrix is not None:
+                K_gs_g = get_k_gg_matrix(
+                    X_star,
+                    self.X_grad_obs,
+                    y_grad_dims=self.grad_dims,
+                )
+                return torch.cat([K_gs_f, K_gs_g], dim=1)
 
         K_gs_f = torch.empty(Ns * D, Nf, dtype=X_star.dtype, device=X_star.device)
 

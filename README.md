@@ -75,7 +75,7 @@ X_g = torch.tensor(
 )
 G_g = grad_true(X_g)
 
-kernel = RDFKernelFunction(theta=torch.tensor([0.8, 0.8]))
+kernel = RBFKernelFunction(theta=torch.tensor([0.8, 0.8]))
 gp = GradientGP(kernel=kernel, sigma_f=1e-8, sigma_g=1e-8, jitter=1e-10)
 
 gp.fit(X_f=X_f, Y_f=Y_f, X_g=X_g, G_g=G_g)
