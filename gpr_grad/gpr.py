@@ -63,16 +63,14 @@ class GradientGP(nn.Module):
                 return K_ff
 
             get_k_fg_matrix = self._kernel_method("get_k_fg_matrix")
-            get_k_gf_matrix = self._kernel_method("get_k_gf_matrix")
             get_k_gg_matrix = self._kernel_method("get_k_gg_matrix")
 
             if (
                 get_k_fg_matrix is not None
-                and get_k_gf_matrix is not None
                 and get_k_gg_matrix is not None
             ):
                 K_fg = get_k_fg_matrix(X_f, X_grad_obs, grad_dims)
-                K_gf = get_k_gf_matrix(X_grad_obs, X_f, grad_dims)
+                K_gf = K_fg.T
                 K_gg = get_k_gg_matrix(
                     X_grad_obs,
                     X_grad_obs,
@@ -171,9 +169,12 @@ class GradientGP(nn.Module):
     # noise
     # =========================
     def build_noise_matrix(self, Nf, Mg, dtype, device):
+        return torch.diag(self.build_noise_vector(Nf, Mg, dtype, device))
+
+    def build_noise_vector(self, Nf, Mg, dtype, device):
         noise_f = self.sigma_f**2 * torch.ones(Nf, dtype=dtype, device=device)
         noise_g = self.sigma_g**2 * torch.ones(Mg, dtype=dtype, device=device)
-        return torch.diag(torch.cat([noise_f, noise_g]))
+        return torch.cat([noise_f, noise_g])
 
     # =========================
     # fit
@@ -197,12 +198,12 @@ class GradientGP(nn.Module):
         Mg = 0 if X_grad_obs is None else X_grad_obs.shape[0]
 
         K_xx = self.build_kernel_matrix(X_f, X_grad_obs, grad_dims)
-        Sigma = self.build_noise_matrix(
+        noise = self.build_noise_vector(
             X_f.shape[0], Mg, dtype=K_xx.dtype, device=K_xx.device
         )
 
-        K = K_xx + Sigma
-        K = K + self.jitter * torch.eye(K.shape[0], dtype=K.dtype, device=K.device)
+        K = K_xx.clone()
+        K.diagonal().add_(noise + self.jitter)
 
         self.L = torch.linalg.cholesky(K)
         self.alpha = torch.cholesky_solve(y_train[:, None], self.L).squeeze(-1)
@@ -330,7 +331,7 @@ class GradientGP(nn.Module):
             uses trace of each D x D block
 
         Case 2: partial gradients
-            cov_grad:     (Mg, Mg)
+            cov_grad:     (Ns*D, Ns*D)
             grad_indices: (Mg, 2), rows = [point_id, grad_dim]
             returns:      (Ns, Ns)
             sums matching derivative-component covariances by point_id
@@ -339,32 +340,20 @@ class GradientGP(nn.Module):
         cov_grad = self.predict_grad_cov(X_star)
         
         if grad_indices is None:
-            
-            K_point = torch.empty(
-                Ns, Ns, dtype=cov_grad.dtype, device=cov_grad.device
-            )
+            blocks = cov_grad.reshape(Ns, D, Ns, D)
+            return blocks.diagonal(dim1=1, dim2=3).sum(dim=-1)
 
-            for i in range(Ns):
-                for j in range(Ns):
-                    block = cov_grad[i*D:(i+1)*D, j*D:(j+1)*D]
-                    K_point[i, j] = torch.trace(block)
+        grad_indices = grad_indices.to(device=cov_grad.device, dtype=torch.long)
+        point_ids = grad_indices[:, 0]
+        dim_ids = grad_indices[:, 1]
+        flat_ids = point_ids * D + dim_ids
 
-            return K_point
+        cov_obs = cov_grad[flat_ids[:, None], flat_ids[None, :]]
+        flat_point_ids = point_ids[:, None] * Ns + point_ids[None, :]
 
-        else:
-            grad_indices = grad_indices.to(cov_grad.device)
-            point_ids = grad_indices[:, 0]
+        K_point = torch.zeros(
+            Ns * Ns, dtype=cov_grad.dtype, device=cov_grad.device
+        )
+        K_point.scatter_add_(0, flat_point_ids.reshape(-1), cov_obs.reshape(-1))
 
-            K_point = torch.zeros(
-                Ns, Ns, dtype=cov_grad.dtype, device=cov_grad.device
-            )
-
-            Mg = grad_indices.shape[0]
-
-            for m in range(Mg):
-                i = point_ids[m].item()
-                for n in range(Mg):
-                    j = point_ids[n].item()
-                    K_point[i, j] += cov_grad[m, n]
-
-            return K_point
+        return K_point.reshape(Ns, Ns)
