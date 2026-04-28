@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import math
 
 __all__ = ["GradientGP"]
 
@@ -194,6 +195,7 @@ class GradientGP(nn.Module):
             y_train = torch.cat([self.Y_f, G_obs])
         else:
             y_train = self.Y_f
+        self.y_train = y_train
 
         Mg = 0 if X_grad_obs is None else X_grad_obs.shape[0]
 
@@ -209,6 +211,27 @@ class GradientGP(nn.Module):
         self.alpha = torch.cholesky_solve(y_train[:, None], self.L).squeeze(-1)
 
         return self
+
+    def log_marginal_likelihood(self):
+        """
+        Return log p(y | X, kernel hyperparameters) for the latest fit.
+
+        The model must be fit first so that the Cholesky factor and alpha are
+        available. The returned scalar remains differentiable with respect to
+        trainable kernel parameters used during fit.
+        """
+        if not hasattr(self, "L") or not hasattr(self, "alpha"):
+            raise RuntimeError("Call fit before log_marginal_likelihood.")
+
+        n = self.y_train.numel()
+        data_fit = self.y_train @ self.alpha
+        log_det = 2.0 * torch.sum(torch.log(torch.diag(self.L)))
+
+        return -0.5 * (
+            data_fit
+            + log_det
+            + n * math.log(2.0 * math.pi)
+        )
 
     # =========================
     # predict
