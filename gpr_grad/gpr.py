@@ -10,13 +10,25 @@ class GradientGP(nn.Module):
         kernel: nn.Module,
         sigma_f: float = 1e-6,
         sigma_g: float = 1e-6,
+        trainable_sigma_f: bool = False,
+        trainable_sigma_g: bool = False,
         jitter: float = 1e-8,
     ):
         super().__init__()
         self.kernel = kernel
-        self.sigma_f = sigma_f
-        self.sigma_g = sigma_g
         self.jitter = jitter
+
+        sigma_g = torch.as_tensor(sigma_g, dtype=torch.get_default_dtype())
+        if trainable_sigma_g:
+            self.sigma_g = nn.Parameter(sigma_g)
+        else:
+            self.register_buffer("sigma_g", sigma_g)
+
+        sigma_f = torch.as_tensor(sigma_f, dtype=torch.get_default_dtype())
+        if trainable_sigma_f:
+            self.sigma_f = nn.Parameter(sigma_f)
+        else:
+            self.register_buffer("sigma_f", sigma_f)
 
     def _kernel_method(self, name):
         method = getattr(self.kernel, name, None)
@@ -27,6 +39,10 @@ class GradientGP(nn.Module):
     # =========================
     def _normalize_grad_inputs(self, X_g, G_g=None, grad_indices=None):
         if X_g is None:
+            if G_g is not None:
+                raise ValueError("G_g was provided, but X_g is None.")
+            if grad_indices is not None:
+                raise ValueError("grad_indices was provided, but X_g is None.")
             return None, None, None
 
         Ng, D = X_g.shape
@@ -37,12 +53,39 @@ class GradientGP(nn.Module):
             dim_ids = torch.arange(D, device=X_g.device).repeat(Ng)
             grad_indices = torch.stack([point_ids, dim_ids], dim=1)
 
-            G_obs = G_g.reshape(-1) if G_g is not None else None
+            if G_g is None:
+                G_obs = None
+            elif G_g.shape == X_g.shape:
+                G_obs = G_g.reshape(-1)
+            else:
+                raise ValueError(
+                    "G_g has partial-gradient shape, but grad_indices is None. "
+                    "Pass grad_indices when using selected gradient components."
+                )
         else:
             grad_indices = grad_indices.to(X_g.device)
+            if grad_indices.ndim != 2 or grad_indices.shape[1] != 2:
+                raise ValueError("grad_indices must have shape (Mg, 2).")
+
             point_ids = grad_indices[:, 0]
             dim_ids = grad_indices[:, 1]
-            G_obs = G_g.reshape(-1) if G_g is not None else None
+
+            if torch.any(point_ids < 0) or torch.any(point_ids >= Ng):
+                raise ValueError("grad_indices point ids are out of bounds for X_g.")
+            if torch.any(dim_ids < 0) or torch.any(dim_ids >= D):
+                raise ValueError("grad_indices dimension ids are out of bounds.")
+
+            if G_g is None:
+                G_obs = None
+            elif G_g.shape == X_g.shape:
+                G_obs = G_g[point_ids, dim_ids]
+            else:
+                G_obs = G_g.reshape(-1)
+                if G_obs.numel() != grad_indices.shape[0]:
+                    raise ValueError(
+                        "Partial-gradient G_g must have one value per row of "
+                        "grad_indices, or G_g must have full shape X_g.shape."
+                    )
 
         X_grad_obs = X_g[point_ids]
         grad_dims = dim_ids
@@ -173,8 +216,10 @@ class GradientGP(nn.Module):
         return torch.diag(self.build_noise_vector(Nf, Mg, dtype, device))
 
     def build_noise_vector(self, Nf, Mg, dtype, device):
-        noise_f = self.sigma_f**2 * torch.ones(Nf, dtype=dtype, device=device)
-        noise_g = self.sigma_g**2 * torch.ones(Mg, dtype=dtype, device=device)
+        sigma_f = self.sigma_f.to(dtype=dtype, device=device)
+        sigma_g = self.sigma_g.to(dtype=dtype, device=device)
+        noise_f = sigma_f**2 * torch.ones(Nf, dtype=dtype, device=device)
+        noise_g = sigma_g**2 * torch.ones(Mg, dtype=dtype, device=device)
         return torch.cat([noise_f, noise_g])
 
     # =========================
@@ -198,6 +243,14 @@ class GradientGP(nn.Module):
         self.y_train = y_train
 
         Mg = 0 if X_grad_obs is None else X_grad_obs.shape[0]
+
+        if Mg > 0 and G_obs is None:
+            raise ValueError("X_g was provided, so G_g must also be provided.")
+        if y_train.numel() != X_f.shape[0] + Mg:
+            raise ValueError(
+                "Training target length does not match the kernel matrix size. "
+                "If G_g contains selected gradient components, pass grad_indices."
+            )
 
         K_xx = self.build_kernel_matrix(X_f, X_grad_obs, grad_dims)
         noise = self.build_noise_vector(

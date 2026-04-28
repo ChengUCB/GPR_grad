@@ -57,10 +57,31 @@ class RBFKernelFunction(KernelFunction):
         super().__init__(theta, trainable=trainable)
         
         theta = torch.as_tensor(theta, dtype=torch.get_default_dtype())
+        if torch.any(theta <= 0):
+            raise ValueError("RBF length scales must be positive.")
+
+        raw_theta = torch.log(theta)
         if trainable:
-            self.theta = nn.Parameter(theta)
+            self.raw_theta = nn.Parameter(raw_theta)
         else:
-            self.register_buffer("theta", theta)
+            self.register_buffer("raw_theta", raw_theta)
+
+    @property
+    def theta(self):
+        return torch.exp(self.raw_theta)
+
+    @theta.setter
+    def theta(self, value):
+        value = torch.as_tensor(
+            value,
+            dtype=self.raw_theta.dtype,
+            device=self.raw_theta.device,
+        )
+        if torch.any(value <= 0):
+            raise ValueError("RBF length scales must be positive.")
+
+        with torch.no_grad():
+            self.raw_theta.copy_(torch.log(value))
 
     def _theta_like(self, X: torch.Tensor):
         return self.theta.to(dtype=X.dtype, device=X.device)
