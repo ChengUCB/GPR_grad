@@ -8,9 +8,10 @@ Gaussian Process Regression with function-value and gradient observations, imple
 
 - `GradientGP`: exact GP regression with dense covariance matrices and Cholesky solves.
 - `KernelFunction`: a kernel interface for function, function-gradient, and gradient-gradient covariance terms.
-- `RBFKernelFunction`: an RBF-style squared exponential kernel with scalar or per-dimension length scales.
-- `CUR_deterministic`: deterministic leverage-score-inspired column/row selection for covariance or similarity matrices.
-- `test/test-GP.ipynb`: a worked notebook showing partial-gradient fitting, prediction, uncertainty estimates, and CUR selection.
+- `RBFKernelFunction`: an RBF-style squared exponential kernel with scalar or per-dimension length scales, plus vectorized block assembly.
+- `log_marginal_likelihood`: differentiable GP marginal likelihood for optimizing kernel hyperparameters.
+- `CUR_deterministic`: deterministic leverage-score-inspired column/row selection with exact and LOBPCG eigensolver options.
+- `test/test-GP.ipynb`: a worked notebook showing noisy partial-gradient fitting, hyperparameter optimization, prediction, uncertainty estimates, and CUR selection.
 
 ## Repository layout
 
@@ -76,7 +77,7 @@ X_g = torch.tensor(
 G_g = grad_true(X_g)
 
 kernel = RBFKernelFunction(theta=torch.tensor([0.8, 0.8]))
-gp = GradientGP(kernel=kernel, sigma_f=1e-8, sigma_g=1e-8, jitter=1e-10)
+gp = GradientGP(kernel=kernel, sigma_f=1e-6, sigma_g=1e-6, jitter=1e-8)
 
 gp.fit(X_f=X_f, Y_f=Y_f, X_g=X_g, G_g=G_g)
 
@@ -140,22 +141,98 @@ gp.fit(
 )
 ```
 
+When `grad_indices` is provided, `G_g` may also be the full gradient array with shape `(Ng, D)`; the selected components are gathered internally. If `G_g` contains selected components only, `grad_indices` is required. Omitting it will raise a validation error instead of building a mismatched kernel and target vector.
+
+## Hyperparameter optimization
+
+`GradientGP.log_marginal_likelihood()` returns the differentiable log marginal likelihood for the most recent fit. This can be maximized to tune trainable kernel parameters such as RBF length scales.
+
+```python
+kernel = RBFKernelFunction(
+    theta=torch.tensor([0.5, 0.5]),
+    trainable=True,
+)
+
+gp = GradientGP(
+    kernel=kernel,
+    sigma_f=0.02,
+    sigma_g=0.05,
+    jitter=1e-8,
+)
+
+optimizer = torch.optim.Adam(gp.parameters(), lr=1e-2)
+
+for step in range(300):
+    optimizer.zero_grad()
+
+    gp.fit(
+        X_f=X_f,
+        Y_f=Y_f,
+        X_g=X_g,
+        G_g=G_obs,
+        grad_indices=grad_indices,
+    )
+
+    loss = -gp.log_marginal_likelihood()
+    loss.backward()
+    optimizer.step()
+
+    if step % 50 == 0:
+        print(
+            f"step={step:03d}",
+            f"lml={-loss.item():.6f}",
+            f"theta={kernel.theta.detach().tolist()}",
+        )
+```
+
+`RBFKernelFunction(trainable=True)` stores `raw_theta` as the optimized parameter and exposes `theta = exp(raw_theta)`, so length scales stay positive without manual clamping.
+
+Function and gradient observation noise can also be registered as parameters:
+
+```python
+gp = GradientGP(
+    kernel=kernel,
+    sigma_f=0.02,
+    sigma_g=0.05,
+    trainable_sigma_f=True,
+    trainable_sigma_g=True,
+)
+```
+
+The current noise parameters are optimized directly, so keep them positive after each optimizer step or replace them with your own log-parameterization if you need unconstrained optimization:
+
+```python
+with torch.no_grad():
+    gp.sigma_f.clamp_(min=1e-8)
+    gp.sigma_g.clamp_(min=1e-8)
+```
+
 ## API notes
 
 ### `GradientGP`
 
 ```python
-GradientGP(kernel, sigma_f=1e-6, sigma_g=1e-6, jitter=1e-8)
+GradientGP(
+    kernel,
+    sigma_f=1e-6,
+    sigma_g=1e-6,
+    trainable_sigma_f=False,
+    trainable_sigma_g=False,
+    jitter=1e-8,
+)
 ```
 
 - `kernel`: a kernel module implementing the `KernelFunction` methods.
 - `sigma_f`: observation noise standard deviation for function values.
 - `sigma_g`: observation noise standard deviation for gradient values.
+- `trainable_sigma_f`: whether to register `sigma_f` as a trainable parameter.
+- `trainable_sigma_g`: whether to register `sigma_g` as a trainable parameter.
 - `jitter`: diagonal stabilization added before Cholesky factorization.
 
 Main methods:
 
 - `fit(X_f, Y_f, X_g=None, G_g=None, grad_indices=None)`: stores training data, builds the joint function/gradient covariance matrix, and computes the Cholesky factorization.
+- `log_marginal_likelihood()`: returns the differentiable log marginal likelihood for the most recent fit.
 - `predict(X_star, return_cov=True)`: returns posterior function mean and, optionally, posterior function covariance.
 - `predict_grad_cov(X_star)`: returns posterior covariance over all derivative components at `X_star`, with shape `(Ns * D, Ns * D)`.
 - `predict_grad_cov_by_points(X_star, grad_indices=None)`: converts derivative-component covariance into a point-level covariance matrix with shape `(Ns, Ns)`.
@@ -182,18 +259,34 @@ The built-in kernel computes:
 k(x, y) = exp(-0.5 * sum(((x - y) / theta) ** 2))
 ```
 
-`theta` may be a scalar length scale or a tensor of per-dimension length scales. If `trainable=True`, `theta` is stored as a `torch.nn.Parameter`; otherwise it is registered as a module buffer.
+`theta` may be a scalar length scale or a tensor of per-dimension length scales. It must be positive. Internally, the kernel stores `raw_theta = log(theta)` and exposes `theta = exp(raw_theta)`. If `trainable=True`, `raw_theta` is a `torch.nn.Parameter`; otherwise it is registered as a module buffer.
+
+The RBF kernel also provides vectorized block methods used automatically by `GradientGP`:
+
+- `get_k_matrix(X, Y)`
+- `get_k_fg_matrix(X, Y, grad_dims=None)`
+- `get_k_gf_matrix(X, Y, grad_dims=None)`
+- `get_k_gg_matrix(X, Y, x_grad_dims=None, y_grad_dims=None)`
+
+Custom kernels do not need to implement these methods; `GradientGP` falls back to the scalar `KernelFunction` interface when vectorized methods are unavailable.
 
 ### `CUR_deterministic`
 
 ```python
-rsel, rerror = CUR_deterministic(X, n_col, error_estimate=True, costs=1.0)
+rsel, rerror = CUR_deterministic(
+    X,
+    n_col,
+    error_estimate=True,
+    costs=1.0,
+    eigensolver="auto",
+)
 ```
 
 - `X`: square covariance or similarity matrix with shape `(N, N)`.
 - `n_col`: number of indices to select.
 - `error_estimate`: whether to record residual error after each selection.
 - `costs`: scalar or length-`N` tensor of selection costs.
+- `eigensolver`: `"exact"` reproduces the original full eigendecomposition path, `"lobpcg"` uses an iterative top-k solve, and `"auto"` uses exact solves for small or unsuitable matrices and LOBPCG for larger top-k cases.
 
 The function returns selected indices and residual-error estimates. This is useful for selecting high-uncertainty or high-leverage candidate points from a GP posterior covariance matrix.
 
@@ -207,7 +300,9 @@ jupyter notebook test/test-GP.ipynb
 
 The notebook demonstrates:
 
+- adding random observation noise to function and gradient data,
 - fitting with partial gradient components,
+- optimizing RBF length scales with log marginal likelihood,
 - checking interpolation at observed function and gradient data,
 - predicting on a 2D grid,
 - computing posterior function and gradient covariance,
@@ -216,7 +311,7 @@ The notebook demonstrates:
 
 ## Performance and limitations
 
-`GradientGP` builds dense covariance matrices using Python loops and solves them exactly with Cholesky factorization. This makes the implementation straightforward and useful for small experiments, but memory and runtime scale poorly for large datasets.
+`GradientGP` solves the dense exact GP problem with Cholesky factorization. The built-in RBF kernel uses vectorized block assembly for the function, function-gradient, and gradient-gradient covariance terms; custom kernels without vectorized block methods fall back to scalar Python loops.
 
 Let `Nf` be the number of function observations and `Mg` be the number of observed derivative components. The joint training matrix has shape `(Nf + Mg, Nf + Mg)`, so exact inference requires dense linear algebra on that full matrix.
 
