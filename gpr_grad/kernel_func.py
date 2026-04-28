@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from typing import List
 
-__all__ = ["KernelFunction", "RDFKernelFunction"]
+__all__ = ["KernelFunction", "RBFKernelFunction"]
 
 class KernelFunction(nn.Module):
     def __init__(self, theta: torch.Tensor, trainable=False):
@@ -52,7 +52,7 @@ class KernelFunction(nn.Module):
         ], dim=0)
 
 
-class RDFKernelFunction(KernelFunction):
+class RBFKernelFunction(KernelFunction):
     def __init__(self, theta: torch.Tensor, trainable=False):
         super().__init__(self)
         
